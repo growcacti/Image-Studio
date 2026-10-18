@@ -18,7 +18,7 @@ import tkinter as tk
 from tkinter import ttk, filedialog as fd, messagebox as mb, simpledialog as sd, colorchooser
 from datetime import datetime
 try:
-    from PIL import Image, ImageTk, ImageOps, ImageEnhance, ImageFilter, ImageDraw, ImageSequence
+    from PIL import Image, ImageTk, ImageOps, ImageEnhance, ImageFilter, ImageDraw, ImageSequence, ImageGrab
 except ImportError:
     raise SystemExit('Install Pillow first: python -m pip install Pillow')
 
@@ -140,13 +140,164 @@ class Studio(tk.Tk):
         self.organizer = ttk.Frame(self.nb); self.editor = ttk.Frame(self.nb); self.batch = ttk.Frame(self.nb); self.tools = ttk.Frame(self.nb)
         for f, title in [(self.organizer,'Organizer'),(self.editor,'Editor'),(self.batch,'Batch Processing'),(self.tools,'Sprites • Tiles • Animation • Encoding')]: self.nb.add(f, text=title)
         self.build_organizer(); self.build_editor(); self.build_batch(); self.build_tools()
+        self.thumbnail = ttk.Frame(self.nb); self.nb.insert(1, self.thumbnail, text='Clipboard Thumbnails')
+        self.build_thumbnail()
         bottom = ttk.Frame(self, padding=8); bottom.pack(fill='x')
         self.status = tk.StringVar(value='Choose a folder and scan, or open an image in Editor.')
         ttk.Label(bottom, textvariable=self.status).pack(side='left', fill='x', expand=True)
         ttk.Button(bottom, text='Cancel job', command=self.cancel.set).pack(side='right')
         self.after(80, self.poll); self.protocol('WM_DELETE_WINDOW', self.close)
         self.bind('<Control-z>', lambda e: self.undo()); self.bind('<Control-y>', lambda e: self.undo(True))
-        self.bind('<Control-s>', lambda e: self.save()); self.bind('<Control-o>', lambda e: self.open())
+        self.bind('<Control-s>', lambda e: self.thumb_save() if self.nb.select()==str(self.thumbnail) else self.save()); self.bind('<Control-o>', lambda e: self.open())
+
+    def build_thumbnail(self):
+        self.thumb_image = None
+        self.thumb_dirty = False
+        self.thumb_box = None
+        self.thumb_folder = tk.StringVar(value=self.settings.get('thumbnail_folder', self.path.get()))
+        self.thumb_name = tk.StringVar(value='thumbnail.png')
+        self.thumb_width = tk.StringVar(value=self.settings.get('thumbnail_width', '0'))
+        self.thumb_height = tk.StringVar(value=self.settings.get('thumbnail_height', '0'))
+        ttk.Label(self.thumbnail, text='Screenshot → Paste image → Choose game/file (or paste its name) → Save PNG. Drag on the preview to crop.', padding=8).pack(anchor='w')
+        self.buttons(self.thumbnail, [('Paste image', self.thumb_paste), ('Paste + Save', lambda:self.thumb_paste(True)),
+            ('Choose game/file…', self.thumb_choose_file), ('Save PNG', self.thumb_save),
+            ('Crop selection', self.thumb_crop), ('Open in Editor', self.thumb_to_editor)])
+        form = ttk.Frame(self.thumbnail); form.pack(fill='x')
+        self.field(form, 0, 'Destination folder', self.thumb_folder)
+        self.field(form, 1, 'PNG filename', self.thumb_name)
+        row = self.buttons(self.thumbnail, [('Browse destination…', lambda:self.choose_output(self.thumb_folder)),
+            ('Use shared folder above', lambda:self.thumb_folder.set(self.path.get())),
+            ('Paste filename', self.thumb_paste_name)])
+        ttk.Label(row, text='Max width').pack(side='left', padx=(12,2))
+        ttk.Entry(row, textvariable=self.thumb_width, width=6).pack(side='left')
+        ttk.Label(row, text='Max height').pack(side='left', padx=(8,2))
+        ttk.Entry(row, textvariable=self.thumb_height, width=6).pack(side='left')
+        ttk.Label(row, text='0 = original; proportions kept').pack(side='left', padx=8)
+        self.thumb_info = tk.StringVar(value='Click the canvas, then Ctrl+V to paste a screenshot. Ctrl+S saves PNG.')
+        ttk.Label(self.thumbnail, textvariable=self.thumb_info, padding=6).pack(anchor='w')
+        self.thumb_canvas = tk.Canvas(self.thumbnail, bg='#243440', highlightthickness=0, takefocus=True)
+        self.thumb_canvas.pack(fill='both', expand=True, padx=6, pady=6)
+        self.thumb_canvas.bind('<Control-v>', lambda e:(self.thumb_paste(), 'break')[1])
+        self.thumb_canvas.bind('<Configure>', lambda e:self.thumb_render())
+        self.thumb_canvas.bind('<Button-1>', self.thumb_start)
+        self.thumb_canvas.bind('<B1-Motion>', self.thumb_drag)
+        self.thumb_canvas.bind('<Button-3>', lambda e:self.thumb_paste())
+        self.thumb_canvas.create_text(25,25,anchor='nw',fill='white',text='Paste image button, Ctrl+V here, or right-click to paste.')
+
+    def thumb_resolve_folder(self, value):
+        """Map an already mounted smb URI to its Linux GVfs filesystem path."""
+        if value.lower().startswith('smb://'):
+            from urllib.parse import urlsplit, unquote
+            uri = urlsplit(value)
+            parts = unquote(uri.path).strip('/').split('/')
+            host, share = uri.hostname, parts[0]
+            root = Path(os.environ.get('XDG_RUNTIME_DIR', '/run/user/' + str(os.getuid()))) / 'gvfs'
+            for mount in root.glob('smb-share:*'):
+                attrs = dict(item.split('=',1) for item in mount.name.split(':',1)[1].split(',') if '=' in item)
+                if attrs.get('server','').casefold()==(host or '').casefold() and attrs.get('share','').casefold()==share.casefold():
+                    return mount.joinpath(*parts[1:])
+            raise ValueError('Open this Samba share in Thunar first, or choose its mounted folder with Browse destination. On Windows use a UNC path.')
+        return Path(value).expanduser()
+
+    def thumb_choose_file(self):
+        try: folder = self.thumb_resolve_folder(self.thumb_folder.get())
+        except Exception: folder = Path.home()
+        path = fd.askopenfilename(title='Choose game or file to name its thumbnail', initialdir=str(folder), filetypes=[('All files', '*')])
+        if path:
+            self.thumb_folder.set(str(Path(path).parent))
+            self.thumb_name.set(Path(path).stem + '.png')
+
+    def thumb_paste_name(self):
+        try: name = self.clipboard_get().strip().strip('"')
+        except tk.TclError:
+            mb.showinfo('Filename', 'Copy a filename as text first.'); return
+        name = name.replace('\\', '/').rsplit('/', 1)[-1]
+        if not name or '\n' in name or '\r' in name:
+            mb.showerror('Filename', 'Copy one filename at a time.'); return
+        self.thumb_name.set(Path(name).stem + '.png')
+
+    def thumb_paste(self, save=False):
+        if self.thumb_dirty and not mb.askyesno('Unsaved thumbnail', 'Replace the unsaved thumbnail with the clipboard image?'): return
+        def read():
+            try: result = ImageGrab.grabclipboard()
+            except Exception as exc:
+                raise ValueError('Could not read the image clipboard. On Linux install xclip (Xfce/X11) or wl-clipboard (Wayland), then copy a screenshot as an image. Details: ' + str(exc)) from exc
+            if isinstance(result, list):
+                for path in result:
+                    try: return load_image(path)
+                    except (OSError, ValueError): continue
+            if not isinstance(result, Image.Image):
+                raise ValueError('No image on the clipboard. Copy a screenshot as an image, then use Paste image. Filename text is pasted separately.')
+            return result.convert('RGBA')
+        def done(im):
+            self.thumb_image = im; self.thumb_dirty = True; self.thumb_box = None
+            self.thumb_render(); self.thumb_canvas.focus_set()
+            self.status.set('Clipboard image ready. Choose a filename and Save PNG.')
+            if save: self.thumb_save()
+        self.job(read, done)
+
+    def thumb_render(self):
+        if self.thumb_image is None: return
+        canvas = self.thumb_canvas
+        w,h = max(1,canvas.winfo_width()-20), max(1,canvas.winfo_height()-20)
+        self.thumb_scale = min(w/self.thumb_image.width, h/self.thumb_image.height, 1)
+        im = self.thumb_image.copy(); im.thumbnail((w,h), Image.Resampling.LANCZOS)
+        self.thumb_photo = ImageTk.PhotoImage(im)
+        canvas.delete('all'); canvas.create_image(10,10,anchor='nw',image=self.thumb_photo)
+        self.thumb_box = None; self.thumb_rect = None
+        self.thumb_info.set(f'{self.thumb_image.width} × {self.thumb_image.height} pixels • Drag to select crop • Ctrl+S saves PNG')
+
+    def thumb_point(self, e):
+        return tuple(max(0,min(limit,round((value-10)/self.thumb_scale))) for value,limit in [(e.x,self.thumb_image.width),(e.y,self.thumb_image.height)])
+
+    def thumb_start(self, e):
+        self.thumb_canvas.focus_set()
+        if self.thumb_image is None: return
+        self.thumb_anchor = self.thumb_point(e); self.thumb_box = None
+        if self.thumb_rect: self.thumb_canvas.delete(self.thumb_rect)
+        self.thumb_rect = self.thumb_canvas.create_rectangle(e.x,e.y,e.x,e.y,outline='#ffc34d',width=2)
+
+    def thumb_drag(self, e):
+        if self.thumb_image is None or not self.thumb_rect: return
+        x,y = self.thumb_point(e); a,b = self.thumb_anchor
+        self.thumb_box = (min(a,x),min(b,y),max(a,x),max(b,y))
+        self.thumb_canvas.coords(self.thumb_rect, *[10+v*self.thumb_scale for v in self.thumb_box])
+
+    def thumb_crop(self):
+        box = self.thumb_box
+        if not box or box[0]>=box[2] or box[1]>=box[3]:
+            mb.showinfo('Crop', 'Drag a rectangle on the preview first.'); return
+        self.thumb_image = self.thumb_image.crop(box); self.thumb_dirty = True; self.thumb_render()
+
+    def thumb_to_editor(self):
+        if self.thumb_image is not None and self.discard(): self.set_image(self.thumb_image.copy())
+
+    def thumb_save(self):
+        if self.thumb_image is None:
+            mb.showinfo('Thumbnail', 'Paste a screenshot first.'); return
+        if self.busy:
+            mb.showinfo('Working', 'Wait for the current job to finish.'); return
+        try:
+            if not self.thumb_folder.get().strip(): raise ValueError('Choose a destination folder.')
+            folder = self.thumb_resolve_folder(self.thumb_folder.get().strip())
+            if not folder.is_dir(): raise ValueError('Destination unavailable. Mount/open the Samba share or choose an existing folder.')
+            name = self.thumb_name.get().strip()
+            if not name or name in ('.','..') or re.search(r'[\\/:*?"<>|\x00-\x1f]', name):
+                raise ValueError('Enter a filename without path separators or special path characters.')
+            if not name.lower().endswith('.png'): name += '.png'
+            width,height = int(self.thumb_width.get()), int(self.thumb_height.get())
+            if not 0<=width<=20000 or not 0<=height<=20000: raise ValueError('Dimensions must be from 0 to 20000.')
+            im = transform(self.thumb_image.copy(), width, height)
+            target = folder / name; exists = target.exists()
+            if exists and not mb.askyesno('Overwrite thumbnail', f'Replace {target}?'): return
+        except Exception as exc:
+            mb.showerror('Save thumbnail', str(exc)); return
+        def done(result):
+            self.thumb_dirty = False; self.thumb_name.set(name)
+            self.settings.update(thumbnail_folder=self.thumb_folder.get(), thumbnail_width=str(width), thumbnail_height=str(height))
+            self.persist(); self.status.set(f'Saved PNG: {target} • {im.width} × {im.height}')
+            self.thumb_info.set(f'Saved {name} • Ready for the next screenshot')
+        self.job(lambda:save_image(im,target,overwrite=exists), done)
 
     def buttons(self, parent, items):
         row = ttk.Frame(parent, padding=5); row.pack(fill='x')
@@ -566,6 +717,7 @@ class Studio(tk.Tk):
             Path(out).write_bytes(data); self.status.set('Decoded original image bytes.')
     def close(self):
         if not self.discard(): return
+        if self.thumb_dirty and not mb.askyesno('Unsaved thumbnail', 'Close without saving the clipboard thumbnail?'): return
         self.cancel.set(); self.persist(); self.destroy()
 
 if __name__=='__main__': Studio().mainloop()
